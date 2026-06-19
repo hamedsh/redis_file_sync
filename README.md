@@ -65,18 +65,6 @@ python main.py stop
 
 ---
 
-## Project structure
-
-```
-folder_syncer/
-├── main.py        # Entry point – daemon lifecycle + sync logic
-├── settings.py    # Pydantic settings model (reads .env)
-├── .env.example   # Template for environment configuration
-└── README.md
-```
-
----
-
 ## Notes
 
 - The boot restore uses **file size** as a quick equality check. If a file
