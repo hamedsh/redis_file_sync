@@ -1,79 +1,106 @@
 import base64
+import logging
 import os
 import sys
 import time
 
-from initialize import redis_client, logger, settings
+from redis import Redis
+
+from settings import Settings
 
 
-def sync_file_to_redis(filepath: str) -> None:
-    """Upsert file metadata and content into Redis."""
-    if not os.path.exists(filepath):
-        return
-    try:
-        stat = os.stat(filepath)
-        with open(filepath, "rb") as f:
-            encoded = base64.b64encode(f.read()).decode()
-        file_data = {
-            "filename": os.path.basename(filepath),
-            "size_bytes": str(stat.st_size),
-            "mtime": str(stat.st_mtime),
-            "content_stub": encoded,
-        }
-        redis_client.hset(get_redis_key(filepath), mapping=file_data)
-        logger.info(f"Runtime Sync -> Updated DB: {filepath}")
-    except Exception as e:
-        logger.error(f"Runtime Sync Failure -> {filepath}: {e}")
+class SyncService:
+    """
+    Encapsulates all Redis sync operations.
 
+    Dependencies (settings, logger, redis) are injected once at construction
+    time — no repeated getter calls per operation.
+    """
 
-def remove_file_from_redis(filepath: str) -> None:
-    """Delete the Redis key for a locally-removed file."""
-    redis_client.delete(get_redis_key(filepath))
-    logger.info(f"Runtime Sync -> Purged key from DB: {filepath}")
+    def __init__(self, settings: Settings, logger: logging.Logger, redis: Redis) -> None:
+        self._settings = settings
+        self._logger = logger
+        self._redis = redis
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-def get_redis_key(filepath: str) -> str:
-    return f"{settings.redis_key_prefix}{os.path.abspath(filepath)}"
+    def _redis_key(self, filepath: str) -> str:
+        return f"{self._settings.redis_key_prefix}{os.path.abspath(filepath)}"
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-def load_and_restore_from_redis() -> None:
-    logger.info("Boot Phase: Restoring files from Redis to local storage...")
-    os.makedirs(settings.watch_dir, exist_ok=True)
+    def sync_file(self, filepath: str) -> None:
+        """Upsert file metadata and content into Redis."""
+        if not os.path.exists(filepath):
+            return
+        try:
+            stat = os.stat(filepath)
+            with open(filepath, "rb") as f:
+                encoded = base64.b64encode(f.read()).decode()
+            file_data = {
+                "filename": os.path.basename(filepath),
+                "size_bytes": str(stat.st_size),
+                "mtime": str(stat.st_mtime),
+                "content_stub": encoded,
+            }
+            self._redis.hset(self._redis_key(filepath), mapping=file_data)
+            self._logger.info(f"Runtime Sync -> Updated DB: {filepath}")
+        except Exception as e:
+            self._logger.error(f"Runtime Sync Failure -> {filepath}: {e}")
 
-    cached_keys = redis_client.keys(f"{settings.redis_key_prefix}*")
+    def remove_file(self, filepath: str) -> None:
+        """Delete the Redis key for a locally-removed file."""
+        self._redis.delete(self._redis_key(filepath))
+        self._logger.info(f"Runtime Sync -> Purged key from DB: {filepath}")
 
-    if not cached_keys:
-        logger.info("No files found in Redis. Starting fresh.")
-        return
+    def load_and_restore(self) -> None:
+        """On startup: restore every cached file from Redis back to disk."""
+        settings = self._settings
+        self._logger.info("Boot Phase: Restoring files from Redis to local storage...")
+        os.makedirs(settings.watch_dir, exist_ok=True)
 
-    for key in cached_keys:
-        physical_path = key.replace(settings.redis_key_prefix, "")
-        file_metadata = redis_client.hgetall(key)
-        if not file_metadata:
-            continue
+        cached_keys = self._redis.keys(f"{settings.redis_key_prefix}*")
 
-        file_content = file_metadata.get("content_stub", "")
-        os.makedirs(os.path.dirname(physical_path), exist_ok=True)
+        if not cached_keys:
+            self._logger.info("No files found in Redis. Starting fresh.")
+            return
 
-        if os.path.exists(physical_path):
-            cached_size = int(file_metadata.get("size_bytes", 0))
-            if os.path.getsize(physical_path) == cached_size:
-                logger.info(f"File matches DB state. Skipping: {physical_path}")
+        for key in cached_keys:
+            physical_path = key.replace(settings.redis_key_prefix, "")
+            file_metadata = self._redis.hgetall(key)
+            if not file_metadata:
                 continue
 
-        try:
-            with open(physical_path, "wb") as f:
-                f.write(base64.b64decode(file_content))
-            logger.info(f"Restored from Redis: {physical_path}")
+            file_content = file_metadata.get("content_stub", "")
+            os.makedirs(os.path.dirname(physical_path), exist_ok=True)
 
-            if "mtime" in file_metadata:
-                mtime = float(file_metadata["mtime"])
-                os.utime(physical_path, (time.time(), mtime))
-        except Exception as e:
-            logger.error(f"Failed to restore {physical_path}: {e}")
+            if os.path.exists(physical_path):
+                cached_size = int(file_metadata.get("size_bytes", 0))
+                if os.path.getsize(physical_path) == cached_size:
+                    self._logger.info(f"File matches DB state. Skipping: {physical_path}")
+                    continue
 
-    logger.info("Boot reconstruction phase complete.")
+            try:
+                with open(physical_path, "wb") as f:
+                    f.write(base64.b64decode(file_content))
+                self._logger.info(f"Restored from Redis: {physical_path}")
 
+                if "mtime" in file_metadata:
+                    mtime = float(file_metadata["mtime"])
+                    os.utime(physical_path, (time.time(), mtime))
+            except Exception as e:
+                self._logger.error(f"Failed to restore {physical_path}: {e}")
+
+        self._logger.info("Boot reconstruction phase complete.")
+
+
+# ------------------------------------------------------------------
+# Process utilities (no external dependencies, stay as plain functions)
+# ------------------------------------------------------------------
 
 def write_pid(pid_file: str) -> None:
     with open(pid_file, "w") as f:
@@ -92,9 +119,8 @@ def daemonize() -> None:
     """
     Double-fork daemonization.
     Detaches the process from the controlling terminal so it runs in the
-    background without any TTY.  Log output goes to settings.log_file.
+    background without any TTY.
     """
-    # First fork
     pid = os.fork()
     if pid > 0:
         sys.exit(0)

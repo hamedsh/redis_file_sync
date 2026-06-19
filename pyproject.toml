@@ -5,6 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "click>=8.4.1",
+    "lagom>=2.7.7",
+    "pydanclick>=0.5.1",
     "pydantic-settings>=2.14.1",
     "redis>=8.0.0",
     "watchdog>=6.0.0",

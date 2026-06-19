@@ -15,10 +15,3 @@ class Settings(BaseSettings):
     redis_key_prefix: str = "file_cache:"
     pid_file: str = "/tmp/folder_syncer.pid"
     log_file: str = "/tmp/folder_syncer.log"
-
-    @field_validator("watch_dir")
-    @classmethod
-    def validate_api_key(cls, value):
-        if not value:
-            raise ValueError("WATCH_DIR environment variable must be set.")
-        return value

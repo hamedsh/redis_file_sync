@@ -1,3 +1,5 @@
 pydantic-settings
 watchdog
 redis
+click
+lagom

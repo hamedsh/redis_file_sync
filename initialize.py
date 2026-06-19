@@ -1,29 +1,48 @@
 import logging
 import sys
 
+from lagom import Container
 from redis import Redis
 
 from settings import Settings
 
-settings = Settings()
 
+def build_container(settings: Settings | None = None) -> Container:
+    """
+    Build and return a fully-wired DI container.
 
-def setup_logging(log_file: str | None = None) -> logging.Logger:
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
-    if log_file:
-        handlers.append(logging.FileHandler(log_file))
+    Pass a pre-built ``Settings`` instance (e.g. from CLI args) to override
+    the default env/file-based one.
+    """
+    container = Container()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=handlers,
-    )
-    return logging.getLogger("FileSynchronizer")
+    # --- Settings -----------------------------------------------------------
+    if settings is None:
+        settings = Settings()
+    container.define(Settings, lambda: settings)
 
+    # --- Logger -------------------------------------------------------------
+    def _make_logger() -> logging.Logger:
+        handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+        if settings.log_file:
+            handlers.append(logging.FileHandler(settings.log_file))
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(levelname)s - %(message)s",
+            handlers=handlers,
+        )
+        return logging.getLogger("FileSynchronizer")
 
-logger = setup_logging(settings.log_file)
-redis_client = Redis(
-    host=settings.redis_host,
-    port=settings.redis_port,
-    decode_responses=True,
-)
+    container.define(logging.Logger, _make_logger)
+
+    # --- Redis --------------------------------------------------------------
+    def _make_redis() -> Redis:
+        return Redis(
+            host=settings.redis_host,
+            port=settings.redis_port,
+            decode_responses=True,
+        )
+
+    container.define(Redis, _make_redis)
+
+    return container
