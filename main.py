@@ -34,6 +34,14 @@ class FolderWatchHandler(FileSystemEventHandler):
             self._service.remove_file(event.src_path)
 
 
+def _is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def run_syncer(container: Container) -> None:
     """Core sync loop — restore from Redis then watch for changes."""
     settings = container[Settings]
@@ -45,9 +53,9 @@ def run_syncer(container: Container) -> None:
 
     service.load_and_restore()
 
-    event_handler = FolderWatchHandler(service)
+    handler = FolderWatchHandler(service)
     observer = Observer()
-    observer.schedule(event_handler, settings.watch_dir, recursive=True)
+    observer.schedule(handler, settings.watch_dir, recursive=True)
     observer.start()
     logger.info(f"Watching: {settings.watch_dir}")
 
@@ -68,14 +76,6 @@ def run_syncer(container: Container) -> None:
         logger.info("Daemon stopped.")
 
 
-def _is_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
 @click.group()
 def cli():
     """Folder Syncer — watches a directory and syncs files to Redis."""
@@ -88,26 +88,23 @@ def cli():
 def cmd_start(foreground: bool, settings_overrides: Settings) -> None:
     """Start the syncer (background daemon by default)."""
     if settings_overrides.watch_dir is None:
-        raise Exception("watch-dir is required.")
-    container = build_container(settings_overrides)
+        raise click.UsageError("--watch-dir is required.")
 
+    container = build_container(settings_overrides)
     pid = read_pid(settings_overrides.pid_file)
     if pid and _is_running(pid):
         click.echo(f"Already running (PID {pid}).")
         raise SystemExit(1)
 
-    if foreground:
-        run_syncer(container)
-    else:
+    if not foreground:
         daemonize()
-        run_syncer(container)
+    run_syncer(container)
 
 
 @cli.command("stop")
 def cmd_stop() -> None:
     """Stop the running daemon."""
-    container = build_container()
-    settings = container[Settings]
+    settings = build_container()[Settings]
     pid = read_pid(settings.pid_file)
     if not pid or not _is_running(pid):
         click.echo("Daemon is not running.")
@@ -119,13 +116,9 @@ def cmd_stop() -> None:
 @cli.command("status")
 def cmd_status() -> None:
     """Check whether the daemon is running."""
-    container = build_container()
-    settings = container[Settings]
+    settings = build_container()[Settings]
     pid = read_pid(settings.pid_file)
-    if pid and _is_running(pid):
-        click.echo(f"Running (PID {pid}).")
-    else:
-        click.echo("Not running.")
+    click.echo(f"Running (PID {pid})." if pid and _is_running(pid) else "Not running.")
 
 
 if __name__ == "__main__":

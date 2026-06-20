@@ -8,20 +8,17 @@ from settings import Settings
 
 
 def build_container(settings: Settings | None = None) -> Container:
-    """
-    Build and return a fully-wired DI container.
+    """Build and return a fully-wired DI container.
 
     Pass a pre-built ``Settings`` instance (e.g. from CLI args) to override
     the default env/file-based one.
     """
     container = Container()
 
-    # --- Settings -----------------------------------------------------------
     if settings is None:
         settings = Settings()
     container.define(Settings, lambda: settings)
 
-    # --- Logger -------------------------------------------------------------
     def _make_logger() -> logging.Logger:
         handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
         if settings.log_file:
@@ -35,14 +32,9 @@ def build_container(settings: Settings | None = None) -> Container:
 
     container.define(logging.Logger, _make_logger)
 
-    # --- Redis --------------------------------------------------------------
-    def _make_redis() -> Redis:
-        return Redis(
-            host=settings.redis_host,
-            port=settings.redis_port,
-            decode_responses=True,
-        )
-
-    container.define(Redis, _make_redis)
+    container.define(
+        Redis,
+        lambda: Redis(host=settings.redis_host, port=settings.redis_port, decode_responses=True),
+    )
 
     return container

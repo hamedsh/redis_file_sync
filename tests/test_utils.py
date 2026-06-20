@@ -1,138 +1,110 @@
 """
-Tests for utils.py:
-  - get_redis_key
-  - sync_file_to_redis
-  - remove_file_from_redis
-  - load_and_restore_from_redis
-  - write_pid / read_pid
+Tests for SyncService (utils.py) and PID helpers.
 """
 
 import base64
 import os
 import time
 import pytest
-from unittest.mock import MagicMock, patch, call
 
-import utils
-from utils import get_redis_key, sync_file_to_redis, remove_file_from_redis, write_pid, read_pid
+from utils import write_pid, read_pid
 
 
 # ---------------------------------------------------------------------------
-# get_redis_key
+# SyncService._redis_key  (via sync_file / remove_file behaviour)
 # ---------------------------------------------------------------------------
 
-class TestGetRedisKey:
-    def test_uses_prefix_and_absolute_path(self, tmp_path):
-        filepath = str(tmp_path / "sample.txt")
-        with patch("utils.settings") as s:
-            s.redis_key_prefix = "file_cache:"
-            key = get_redis_key(filepath)
-        assert key == f"file_cache:{os.path.abspath(filepath)}"
+class TestRedisKey:
+    def test_uses_prefix_and_absolute_path(self, make_service, tmp_path):
+        f = tmp_path / "sample.txt"
+        f.write_bytes(b"x")
+        service = make_service()
+        service.sync_file(str(f))
+        key_used = service._redis.hset.call_args[0][0]
+        assert key_used == f"file_cache:{os.path.abspath(f)}"
 
-    def test_relative_path_is_resolved(self, tmp_path, monkeypatch):
+    def test_relative_path_is_resolved(self, make_service, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         (tmp_path / "rel.txt").write_text("hi")
-        with patch("utils.settings") as s:
-            s.redis_key_prefix = "ns:"
-            key = get_redis_key("rel.txt")
-        assert key == f"ns:{tmp_path}/rel.txt"
+        service = make_service(watch_dir=str(tmp_path))
+        service.sync_file("rel.txt")
+        key_used = service._redis.hset.call_args[0][0]
+        assert key_used == f"file_cache:{tmp_path}/rel.txt"
 
 
 # ---------------------------------------------------------------------------
-# sync_file_to_redis
+# SyncService.sync_file
 # ---------------------------------------------------------------------------
 
-class TestSyncFileToRedis:
-    def test_stores_correct_fields(self, tmp_path, mock_redis):
+class TestSyncFile:
+    def test_stores_correct_fields(self, make_service, tmp_path, mock_redis):
         f = tmp_path / "hello.txt"
         f.write_bytes(b"hello world")
-
-        with patch("utils.settings") as s:
-            s.redis_key_prefix = "file_cache:"
-            sync_file_to_redis(str(f))
+        make_service().sync_file(str(f))
 
         mock_redis.hset.assert_called_once()
-        _, kwargs = mock_redis.hset.call_args
-        mapping = kwargs["mapping"]
-
+        mapping = mock_redis.hset.call_args[1]["mapping"]
         assert mapping["filename"] == "hello.txt"
         assert mapping["size_bytes"] == str(len(b"hello world"))
         assert mapping["content_stub"] == base64.b64encode(b"hello world").decode()
 
-    def test_skips_nonexistent_file(self, tmp_path, mock_redis):
-        with patch("utils.settings") as s:
-            s.redis_key_prefix = "file_cache:"
-            sync_file_to_redis(str(tmp_path / "ghost.txt"))
-
+    def test_skips_nonexistent_file(self, make_service, tmp_path, mock_redis):
+        make_service().sync_file(str(tmp_path / "ghost.txt"))
         mock_redis.hset.assert_not_called()
 
-    def test_handles_read_error_gracefully(self, tmp_path, mock_redis):
+    def test_handles_read_error_gracefully(self, make_service, tmp_path, mock_redis):
         f = tmp_path / "locked.txt"
         f.write_bytes(b"data")
-
+        from unittest.mock import patch
         with patch("builtins.open", side_effect=PermissionError("no access")):
-            with patch("utils.settings") as s:
-                s.redis_key_prefix = "file_cache:"
-                # Should not raise
-                sync_file_to_redis(str(f))
-
+            make_service().sync_file(str(f))  # must not raise
         mock_redis.hset.assert_not_called()
 
-    def test_binary_file_content_is_preserved(self, tmp_path, mock_redis):
+    def test_binary_file_content_is_preserved(self, make_service, tmp_path, mock_redis):
         binary_data = bytes(range(256))
         f = tmp_path / "binary.bin"
         f.write_bytes(binary_data)
+        make_service().sync_file(str(f))
 
-        with patch("utils.settings") as s:
-            s.redis_key_prefix = "file_cache:"
-            sync_file_to_redis(str(f))
-
-        _, kwargs = mock_redis.hset.call_args
-        decoded = base64.b64decode(kwargs["mapping"]["content_stub"])
-        assert decoded == binary_data
+        mapping = mock_redis.hset.call_args[1]["mapping"]
+        assert base64.b64decode(mapping["content_stub"]) == binary_data
 
 
 # ---------------------------------------------------------------------------
-# remove_file_from_redis
+# SyncService.remove_file
 # ---------------------------------------------------------------------------
 
-class TestRemoveFileFromRedis:
-    def test_deletes_correct_key(self, tmp_path, mock_redis):
+class TestRemoveFile:
+    def test_deletes_correct_key(self, make_service, tmp_path, mock_redis):
         filepath = str(tmp_path / "gone.txt")
-        with patch("utils.settings") as s:
-            s.redis_key_prefix = "file_cache:"
-            remove_file_from_redis(filepath)
-
+        make_service().remove_file(filepath)
         expected_key = f"file_cache:{os.path.abspath(filepath)}"
         mock_redis.delete.assert_called_once_with(expected_key)
 
-    def test_delete_called_even_when_file_missing_locally(self, tmp_path, mock_redis):
+    def test_delete_called_even_when_file_missing_locally(self, make_service, tmp_path, mock_redis):
         """Redis delete should still fire for files already removed from disk."""
-        filepath = str(tmp_path / "never_existed.txt")
-        with patch("utils.settings") as s:
-            s.redis_key_prefix = "file_cache:"
-            remove_file_from_redis(filepath)
-
+        make_service().remove_file(str(tmp_path / "never_existed.txt"))
         mock_redis.delete.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
-# load_and_restore_from_redis
+# SyncService.load_and_restore
 # ---------------------------------------------------------------------------
 
-class TestLoadAndRestoreFromRedis:
-    def _make_metadata(self, content: bytes, path: str) -> dict:
-        stat = os.stat(path) if os.path.exists(path) else None
+class TestLoadAndRestore:
+    def _metadata(self, content: bytes, path: str) -> dict:
+        mtime = os.stat(path).st_mtime if os.path.exists(path) else time.time()
         return {
             "filename": os.path.basename(path),
             "size_bytes": str(len(content)),
-            "mtime": str(stat.st_mtime if stat else time.time()),
+            "mtime": str(mtime),
             "content_stub": base64.b64encode(content).decode(),
         }
 
-    def test_restores_missing_file(self, tmp_path, mock_redis):
+    def test_restores_missing_file(self, make_service, tmp_path, mock_redis):
         content = b"restored content"
-        physical_path = str(tmp_path / "watch" / "restored.txt")
+        watch = tmp_path / "watch"
+        physical_path = str(watch / "restored.txt")
         prefix = "file_cache:"
 
         mock_redis.keys.return_value = [f"{prefix}{physical_path}"]
@@ -143,15 +115,12 @@ class TestLoadAndRestoreFromRedis:
             "content_stub": base64.b64encode(content).decode(),
         }
 
-        with patch("utils.settings") as s:
-            s.watch_dir = str(tmp_path / "watch")
-            s.redis_key_prefix = prefix
-            utils.load_and_restore_from_redis()
+        make_service(watch_dir=str(watch)).load_and_restore()
 
         assert os.path.exists(physical_path)
         assert open(physical_path, "rb").read() == content
 
-    def test_skips_file_with_matching_size(self, tmp_path, mock_redis):
+    def test_skips_file_with_matching_size(self, make_service, tmp_path, mock_redis):
         content = b"existing content"
         watch = tmp_path / "watch"
         watch.mkdir()
@@ -162,27 +131,21 @@ class TestLoadAndRestoreFromRedis:
         mock_redis.keys.return_value = [f"{prefix}{existing}"]
         mock_redis.hgetall.return_value = {
             "filename": "existing.txt",
-            "size_bytes": str(len(content)),  # same size → should skip
+            "size_bytes": str(len(content)),
             "mtime": str(existing.stat().st_mtime),
             "content_stub": base64.b64encode(content).decode(),
         }
 
         original_mtime = existing.stat().st_mtime
-
-        with patch("utils.settings") as s:
-            s.watch_dir = str(watch)
-            s.redis_key_prefix = prefix
-            utils.load_and_restore_from_redis()
-
-        # file should be untouched
+        make_service(watch_dir=str(watch)).load_and_restore()
         assert existing.stat().st_mtime == original_mtime
 
-    def test_overwrites_file_with_different_size(self, tmp_path, mock_redis):
+    def test_overwrites_file_with_different_size(self, make_service, tmp_path, mock_redis):
         watch = tmp_path / "watch"
         watch.mkdir()
         target = watch / "changed.txt"
-        target.write_bytes(b"old")  # 3 bytes on disk
-        new_content = b"brand new content"  # different size
+        target.write_bytes(b"old")
+        new_content = b"brand new content"
         prefix = "file_cache:"
 
         mock_redis.keys.return_value = [f"{prefix}{target}"]
@@ -193,24 +156,15 @@ class TestLoadAndRestoreFromRedis:
             "content_stub": base64.b64encode(new_content).decode(),
         }
 
-        with patch("utils.settings") as s:
-            s.watch_dir = str(watch)
-            s.redis_key_prefix = prefix
-            utils.load_and_restore_from_redis()
-
+        make_service(watch_dir=str(watch)).load_and_restore()
         assert target.read_bytes() == new_content
 
-    def test_no_keys_does_nothing(self, tmp_path, mock_redis):
+    def test_no_keys_does_nothing(self, make_service, mock_redis):
         mock_redis.keys.return_value = []
-
-        with patch("utils.settings") as s:
-            s.watch_dir = str(tmp_path / "watch")
-            s.redis_key_prefix = "file_cache:"
-            utils.load_and_restore_from_redis()
-
+        make_service().load_and_restore()
         mock_redis.hgetall.assert_not_called()
 
-    def test_sets_mtime_after_restore(self, tmp_path, mock_redis):
+    def test_sets_mtime_after_restore(self, make_service, tmp_path, mock_redis):
         content = b"timestamped"
         watch = tmp_path / "watch"
         watch.mkdir()
@@ -226,11 +180,7 @@ class TestLoadAndRestoreFromRedis:
             "content_stub": base64.b64encode(content).decode(),
         }
 
-        with patch("utils.settings") as s:
-            s.watch_dir = str(watch)
-            s.redis_key_prefix = prefix
-            utils.load_and_restore_from_redis()
-
+        make_service(watch_dir=str(watch)).load_and_restore()
         assert abs(target.stat().st_mtime - expected_mtime) < 1.0
 
 
