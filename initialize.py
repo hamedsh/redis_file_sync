@@ -34,7 +34,13 @@ def build_container(settings: Settings | None = None) -> Container:
 
     container.define(
         Redis,
-        lambda: Redis(host=settings.redis_host, port=settings.redis_port, decode_responses=True),
+        lambda: Redis(
+            host=settings.redis_host,
+            port=settings.redis_port,
+            password=settings.redis_password,
+            db=settings.redis_db,
+            decode_responses=True,
+        ),
     )
 
     return container
