@@ -6,40 +6,11 @@ import time
 import click
 import pydanclick
 from lagom import Container
-from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from initialize import build_container
 from settings import Settings
-from utils import SyncService, daemonize, read_pid, write_pid
-
-
-class FolderWatchHandler(FileSystemEventHandler):
-    """Propagates real-time file-system events to Redis via the SyncService."""
-
-    def __init__(self, service: SyncService) -> None:
-        super().__init__()
-        self._service = service
-
-    def on_created(self, event):
-        if not event.is_directory:
-            self._service.sync_file(event.src_path)
-
-    def on_modified(self, event):
-        if not event.is_directory:
-            self._service.sync_file(event.src_path)
-
-    def on_deleted(self, event):
-        if not event.is_directory:
-            self._service.remove_file(event.src_path)
-
-
-def _is_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+from utils import SyncService, daemonize, read_pid, write_pid, FolderWatchHandler, is_running
 
 
 def run_syncer(container: Container) -> None:
@@ -90,14 +61,15 @@ def cmd_start(foreground: bool, settings_overrides: Settings) -> None:
     if settings_overrides.watch_dir is None:
         raise click.UsageError("--watch-dir is required.")
 
-    container = build_container(settings_overrides)
     pid = read_pid(settings_overrides.pid_file)
-    if pid and _is_running(pid):
+    if pid and is_running(pid):
         click.echo(f"Already running (PID {pid}).")
         raise SystemExit(1)
 
     if not foreground:
         daemonize()
+
+    container = build_container(settings_overrides)
     run_syncer(container)
 
 
@@ -106,7 +78,7 @@ def cmd_stop() -> None:
     """Stop the running daemon."""
     settings = build_container()[Settings]
     pid = read_pid(settings.pid_file)
-    if not pid or not _is_running(pid):
+    if not pid or not is_running(pid):
         click.echo("Daemon is not running.")
         raise SystemExit(1)
     os.kill(pid, signal.SIGTERM)
@@ -118,7 +90,7 @@ def cmd_status() -> None:
     """Check whether the daemon is running."""
     settings = build_container()[Settings]
     pid = read_pid(settings.pid_file)
-    click.echo(f"Running (PID {pid})." if pid and _is_running(pid) else "Not running.")
+    click.echo(f"Running (PID {pid})." if pid and is_running(pid) else "Not running.")
 
 
 if __name__ == "__main__":

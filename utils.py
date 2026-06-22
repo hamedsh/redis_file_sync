@@ -5,6 +5,7 @@ import sys
 import time
 
 from redis import Redis
+from watchdog.events import FileSystemEventHandler
 
 from settings import Settings
 
@@ -117,3 +118,31 @@ def daemonize() -> None:
     with open(os.devnull, "r+") as devnull:
         for stream in (sys.stdin, sys.stdout, sys.stderr):
             os.dup2(devnull.fileno(), stream.fileno())
+
+
+class FolderWatchHandler(FileSystemEventHandler):
+    """Propagates real-time file-system events to Redis via the SyncService."""
+
+    def __init__(self, service: SyncService) -> None:
+        super().__init__()
+        self._service = service
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self._service.sync_file(event.src_path)
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            self._service.sync_file(event.src_path)
+
+    def on_deleted(self, event):
+        if not event.is_directory:
+            self._service.remove_file(event.src_path)
+
+
+def is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False

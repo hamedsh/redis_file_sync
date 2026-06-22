@@ -6,7 +6,7 @@ Verifies that watchdog events are routed to the correct SyncService methods.
 from unittest.mock import MagicMock
 import pytest
 
-from main import FolderWatchHandler
+from utils import FolderWatchHandler
 
 
 def _file_event(path: str) -> MagicMock:
