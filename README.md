@@ -4,6 +4,9 @@ A lightweight daemon that keeps a local directory in sync with Redis.
 On boot it restores any files cached in Redis to disk; at runtime it watches
 the directory for changes and mirrors them back to Redis.
 
+## Why?
+If you had a Dockerised service (or similar service) that, for any reason, was not able to use a volume and needed to have a folder persistent between runs, then this service can help you.
+
 ---
 
 ## How it works
