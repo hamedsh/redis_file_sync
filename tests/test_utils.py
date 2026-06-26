@@ -208,3 +208,161 @@ class TestPidHelpers:
             f.write("99999")
         write_pid(pid_file)
         assert read_pid(pid_file) == os.getpid()
+
+
+# ---------------------------------------------------------------------------
+# TOCTOU race-condition tests
+# ---------------------------------------------------------------------------
+
+class TestTOCTOU:
+    """Verify that the three TOCTOU windows identified in utils.py are closed.
+
+    Each test simulates the race that *would* have caused incorrect behaviour
+    with the old check-then-act pattern, and asserts the new implementation
+    handles it correctly.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. sync_file: file deleted between watchdog event and open()
+    # ------------------------------------------------------------------
+
+    def test_sync_file_file_vanishes_before_open_is_silent(
+        self, make_service, tmp_path, mock_redis
+    ):
+        """If a file disappears between the watchdog event and open(), the old
+        code would have returned early from os.path.exists() but might still
+        hit an error if the window was smaller.  The fixed code catches ENOENT
+        from open() itself and treats it as a silent no-op — no hset, no
+        logged error.
+        """
+        ghost = tmp_path / "ghost.txt"
+        # Never write the file — simulates it being deleted before open().
+        make_service().sync_file(str(ghost))
+
+        mock_redis.hset.assert_not_called()
+
+    def test_sync_file_file_deleted_mid_call(
+        self, make_service, tmp_path, mock_redis, monkeypatch
+    ):
+        """Simulate the narrower race: file exists at check time but is deleted
+        by the time open() is reached.  We achieve this by patching open() so
+        it raises FileNotFoundError for any path, mimicking the OS ENOENT.
+        """
+        f = tmp_path / "disappearing.txt"
+        f.write_bytes(b"will vanish")
+
+        def mock_open(*args, **kwargs):
+            raise FileNotFoundError("gone")
+
+        monkeypatch.setattr("builtins.open", mock_open)
+        make_service().sync_file(str(f))  # must not raise
+
+        mock_redis.hset.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # 2. sync_file: stat and read are consistent (fstat on open fd)
+    # ------------------------------------------------------------------
+
+    def test_sync_file_stat_matches_read_content(
+        self, make_service, tmp_path, mock_redis
+    ):
+        """fstat() on the open fd must agree with the bytes actually read.
+        We write a known payload and verify that size_bytes in Redis equals
+        len(content_stub decoded), proving stat and read saw the same inode.
+        """
+        import base64
+
+        content = b"consistent content check"
+        f = tmp_path / "consistent.txt"
+        f.write_bytes(content)
+
+        make_service().sync_file(str(f))
+
+        mapping = mock_redis.hset.call_args[1]["mapping"]
+        stored_size = int(mapping["size_bytes"])
+        decoded = base64.b64decode(mapping["content_stub"])
+
+        # If stat and read were ever out of sync these would diverge.
+        assert stored_size == len(decoded)
+        assert stored_size == len(content)
+
+    # ------------------------------------------------------------------
+    # 3. load_and_restore: single stat() replaces exists() + getsize()
+    # ------------------------------------------------------------------
+
+    def test_restore_skips_when_file_deleted_between_stat_calls(
+        self, make_service, tmp_path, mock_redis, monkeypatch
+    ):
+        """Old code: os.path.exists() → os.path.getsize().  A file could be
+        deleted after exists() returned True but before getsize() ran, causing
+        an unhandled FileNotFoundError.
+
+        The fix uses a single os.stat() call; if it raises OSError the file is
+        simply written (restore path).  This test verifies that when stat()
+        raises (simulated by patching) the restore proceeds without an
+        uncaught exception.
+        """
+        import base64
+        import os
+
+        content = b"race content"
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        target = watch / "race.txt"
+        prefix = "file_cache:"
+
+        mock_redis.keys.return_value = [f"{prefix}{target}"]
+        mock_redis.hgetall.return_value = {
+            "filename": "race.txt",
+            "size_bytes": str(len(content)),
+            "mtime": str(1_700_000_000.0),
+            "content_stub": base64.b64encode(content).decode(),
+        }
+
+        # Patch os.stat so it raises OSError only for the target file,
+        # simulating deletion between the old exists() and getsize() calls.
+        # This prevents breaking os.makedirs which also uses os.stat.
+        original_stat = os.stat
+
+        def mock_stat(path, *args, **kwargs):
+            if str(path) == str(target):
+                raise OSError("no such file")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr("os.stat", mock_stat)
+        make_service(watch_dir=str(watch)).load_and_restore()  # must not raise
+
+        # File should have been (re-)written by the restore path.
+        assert target.read_bytes() == content
+
+    # ------------------------------------------------------------------
+    # 4. write_pid: atomic os.open() flags prevent a double-create race
+    # ------------------------------------------------------------------
+
+    def test_write_pid_uses_atomic_flags(self, tmp_path, monkeypatch):
+        """write_pid must call os.open() with O_CREAT | O_WRONLY | O_TRUNC so
+        that the kernel handles create-or-truncate atomically.  We intercept
+        os.open() to assert the correct flags are passed, without caring about
+        file I/O details.
+        """
+        import io
+
+        pid_file = str(tmp_path / "atomic.pid")
+        expected_flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
+
+        captured = {}
+
+        real_open = os.open
+
+        def spy_open(path, flags, mode=0o777):
+            captured["flags"] = flags
+            # Forward to the real os.open so the file is actually created.
+            return real_open(path, flags, mode)
+
+        monkeypatch.setattr("os.open", spy_open)
+        write_pid(pid_file)
+
+        assert "flags" in captured, "os.open() was never called"
+        assert captured["flags"] == expected_flags, (
+            f"Expected flags {expected_flags:#o}, got {captured['flags']:#o}"
+        )
