@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import time
+from errno import ENOENT
 
 from redis import Redis
 from watchdog.events import FileSystemEventHandler
@@ -25,12 +26,19 @@ class SyncService:
         return f"{self._settings.redis_key_prefix}{os.path.abspath(filepath)}"
 
     def sync_file(self, filepath: str) -> None:
-        """Upsert file metadata and content into Redis."""
-        if not os.path.exists(filepath):
-            return
+        """Upsert file metadata and content into Redis.
+
+        Opens the file first, then calls fstat() on the open file descriptor so
+        that the stat metadata and the content are always consistent with each
+        other — eliminating the TOCTOU window that existed between the previous
+        os.path.exists() / os.stat() / open() sequence.
+        """
         try:
-            stat = os.stat(filepath)
-            content = base64.b64encode(filepath_bytes := open(filepath, "rb").read()).decode()
+            with open(filepath, "rb") as fh:
+                stat = os.fstat(fh.fileno())
+                raw = fh.read()
+
+            content = base64.b64encode(raw).decode()
             self._redis.hset(
                 self._redis_key(filepath),
                 mapping={
@@ -41,6 +49,11 @@ class SyncService:
                 },
             )
             self._logger.info(f"Synced: {filepath}")
+        except OSError as e:
+            if e.errno == ENOENT:
+                self._logger.debug(f"Skipped (already gone): {filepath}")
+            else:
+                self._logger.error(f"Sync failed — {filepath}: {e}")
         except Exception as e:
             self._logger.error(f"Sync failed — {filepath}: {e}")
 
@@ -67,11 +80,13 @@ class SyncService:
 
             os.makedirs(os.path.dirname(physical_path), exist_ok=True)
 
-            if os.path.exists(physical_path):
-                cached_size = int(metadata.get("size_bytes", 0))
-                if os.path.getsize(physical_path) == cached_size:
+            cached_size = int(metadata.get("size_bytes", 0))
+            try:
+                if os.stat(physical_path).st_size == cached_size:
                     self._logger.info(f"Up-to-date, skipping: {physical_path}")
                     continue
+            except OSError:
+                pass
 
             try:
                 with open(physical_path, "wb") as fh:
@@ -91,7 +106,8 @@ class SyncService:
 # ---------------------------------------------------------------------------
 
 def write_pid(pid_file: str) -> None:
-    with open(pid_file, "w") as fh:
+    fd = os.open(pid_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    with os.fdopen(fd, "w") as fh:
         fh.write(str(os.getpid()))
 
 
